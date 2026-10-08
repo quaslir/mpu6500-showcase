@@ -9,6 +9,8 @@ Demo firmware for the [mpu6500-rp2040](https://github.com/quaslir/mpu6500-rp2040
 
 The driver and the [pico-ssd1306](https://github.com/daschr/pico-ssd1306) library are downloaded automatically by CMake (`FetchContent`); nothing has to be installed by hand except the toolchain.
 
+![Web viewer: the board orientation follows the sensor in real time](docs/media/mpu6500-web-view.gif)
+
 ## Requirements
 
 - [Pico SDK](https://github.com/raspberrypi/pico-sdk) 2.0 or newer, with `PICO_SDK_PATH` set

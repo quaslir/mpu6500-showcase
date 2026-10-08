@@ -1,0 +1,861 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>MPU-6500 · hologram</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Oxanium:wght@300;600&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #01030a; }
+  body { -webkit-user-select: none; user-select: none; }
+  canvas { display: block; outline: none; }
+  #hint {
+    position: fixed; left: 50%; top: calc(34px + env(safe-area-inset-top, 0px));
+    transform: translateX(-50%);
+    font: 300 14px/1.4 Oxanium, "Segoe UI", system-ui, sans-serif;
+    letter-spacing: 0.06em; white-space: nowrap;
+    color: rgba(150, 232, 255, 0.75);
+    text-shadow: 0 0 16px rgba(70, 220, 255, 0.6);
+    opacity: 0; transition: opacity 1.2s ease; pointer-events: none;
+  }
+  #hint.show { opacity: 1; }
+  #hint.breathe { animation: breathe 3.4s ease-in-out infinite; }
+  @keyframes breathe { 0%, 100% { color: rgba(150,232,255,0.4); } 50% { color: rgba(150,232,255,0.85); } }
+  #veil { position: fixed; inset: 0; background: #000; pointer-events: none; transition: opacity 2.6s ease; }
+  #veil.gone { opacity: 0; }
+  @media (prefers-reduced-motion: reduce) { #hint.breathe { animation: none; } }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="veil"></div>
+<div id="hint" role="status" aria-live="polite"></div>
+
+<script type="module">
+import * as THREE from "three";
+import { RoundedBoxGeometry } from "three/addons/geometries/RoundedBoxGeometry.js";
+import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+
+/* ==========================================================================
+   Settings. If the board tilts the wrong way, flip a flag here.
+   Expected convention: roll = atan2(ay, az), pitch = atan2(-ax, sqrt(ay²+az²)).
+   ========================================================================== */
+const CONFIG = {
+  invertRoll: false,
+  invertPitch: false,
+  swapRollPitch: false,
+  baudRate: 115200,      // ignored by the Pico's USB CDC, needed by the API
+  staleAfterMs: 1500,    // no valid angles for this long -> back to screensaver
+};
+
+const DEG = 180 / Math.PI, RAD = Math.PI / 180;
+const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* ==========================================================================
+   Parsing: accepts almost anything that carries two angles
+     "12.3,-4.5"   "12.3 -4.5 0"   "R: 12.3 P: -4.5"   "roll=12.3 pitch=-4.5"
+     "123456,12.3,-4.5" (leading timestamp)   "... rad" (radians)
+     six or more numbers: treated as ax ay az gx gy gz, tilt computed here
+   Log lines with other words are ignored.
+   ========================================================================== */
+const NUM = String.raw`[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?`;
+const reNum = new RegExp(NUM, "g");
+const reRoll = new RegExp(String.raw`(?:roll|крен)[^\d+\-.]{0,16}(${NUM})`, "i");
+const rePitch = new RegExp(String.raw`(?:pitch|тангаж)[^\d+\-.]{0,16}(${NUM})`, "i");
+const reR = new RegExp(String.raw`(?:^|[^a-zа-я])r\s*[:=]\s*(${NUM})`, "i");
+const reP = new RegExp(String.raw`(?:^|[^a-zа-я])p\s*[:=]\s*(${NUM})`, "i");
+const allowedWords = /^(deg|degs|degree|degrees|rad|rads|radian|radians|angle|angles|tilt|imu|mpu|data)$/i;
+
+function parseAngles(line) {
+  const s = line.trim();
+  if (!s) return null;
+  const rad = /\brad/i.test(s);
+  const conv = (v) => (rad ? v * DEG : v);
+  const ok = (v) => Number.isFinite(v) && Math.abs(v) <= 360;
+
+  const r = s.match(reRoll)?.[1] ?? s.match(reR)?.[1];
+  const p = s.match(rePitch)?.[1] ?? s.match(reP)?.[1];
+  if (r != null || p != null) {
+    const out = { r: r != null ? conv(+r) : null, p: p != null ? conv(+p) : null };
+    if ((out.r !== null && !ok(out.r)) || (out.p !== null && !ok(out.p))) return null;
+    return out;
+  }
+
+  const words = s.match(/[a-zа-я]{3,}/gi) || [];
+  if (words.some((w) => !allowedWords.test(w))) return null;
+
+  const v = (s.match(reNum) || []).map(Number).filter(Number.isFinite);
+  if (v.length >= 3 && Number.isInteger(v[0]) && Math.abs(v[0]) > 360) v.shift();
+  if (v.length >= 6) {
+    const [ax, ay, az] = v;
+    const n = Math.hypot(ax, ay, az);
+    if ((n > 0.3 && n < 3) || (n > 5 && n < 15) || (n > 1000 && n < 70000)) {
+      return { r: Math.atan2(ay, az) * DEG, p: Math.atan2(-ax, Math.hypot(ay, az)) * DEG };
+    }
+    return null;
+  }
+  if (v.length < 2) return null;
+  const a = conv(v[0]), b = conv(v[1]);
+  return ok(a) && ok(b) ? { r: a, p: b } : null;
+}
+
+/* ==========================================================================
+   Smoothing: One Euro filter. Calm when the sensor rests, quick when it moves.
+   ========================================================================== */
+class OneEuro {
+  constructor(minCutoff, beta, dCutoff) {
+    this.minCutoff = minCutoff; this.beta = beta; this.dCutoff = dCutoff;
+    this.x = null; this.dx = 0;
+  }
+  static alpha(cutoff, dt) { const tau = 1 / (2 * Math.PI * cutoff); return 1 / (1 + tau / dt); }
+  reset() { this.x = null; this.dx = 0; }
+  filter(x, dt) {
+    if (this.x === null) { this.x = x; return x; }
+    const dx = (x - this.x) / dt;
+    this.dx += OneEuro.alpha(this.dCutoff, dt) * (dx - this.dx);
+    const cutoff = this.minCutoff + this.beta * Math.abs(this.dx);
+    this.x += OneEuro.alpha(cutoff, dt) * (x - this.x);
+    return this.x;
+  }
+}
+
+const sensor = {
+  roll: 0, pitch: 0,
+  rawR: null, rawP: null, unR: 0, unP: 0,
+  fR: new OneEuro(1.4, 0.022, 1.2),
+  fP: new OneEuro(1.4, 0.022, 1.2),
+  lastSampleAt: -1e9,
+  rateCount: 0, rateT0: performance.now(), dt: 1 / 100,
+};
+
+function unwrapStep(prevRaw, raw, acc) {
+  if (prevRaw === null) return raw;
+  let d = raw - prevRaw;
+  d -= 360 * Math.round(d / 360);
+  return acc + d;
+}
+
+function resetSensor() {
+  sensor.rawR = sensor.rawP = null;
+  sensor.fR.reset(); sensor.fP.reset();
+  sensor.lastSampleAt = -1e9;
+}
+
+function onAngles(a) {
+  let { r, p } = a;
+  if (CONFIG.swapRollPitch) [r, p] = [p, r];
+  if (r !== null && CONFIG.invertRoll) r = -r;
+  if (p !== null && CONFIG.invertPitch) p = -p;
+
+  // sample-rate estimate (USB delivers lines in bursts, so per-line timing is useless)
+  sensor.rateCount++;
+  const now = performance.now();
+  if (now - sensor.rateT0 > 500) {
+    const hz = sensor.rateCount * 1000 / (now - sensor.rateT0);
+    sensor.dt = 1 / Math.min(2000, Math.max(5, hz));
+    sensor.rateCount = 0; sensor.rateT0 = now;
+  }
+
+  if (r !== null) {
+    sensor.unR = unwrapStep(sensor.rawR, r, sensor.unR); sensor.rawR = r;
+    sensor.roll = sensor.fR.filter(sensor.unR, sensor.dt);
+  }
+  if (p !== null) {
+    sensor.unP = unwrapStep(sensor.rawP, p, sensor.unP); sensor.rawP = p;
+    sensor.pitch = sensor.fP.filter(sensor.unP, sensor.dt);
+  }
+  sensor.lastSampleAt = now;
+}
+
+function onLine(line) {
+  const a = parseAngles(line);
+  if (a) onAngles(a);
+}
+
+/* ==========================================================================
+   Hint line (the only text on the page)
+   ========================================================================== */
+const hintEl = document.getElementById("hint");
+const HINTS = {
+  unsupported: "Open this page in Chrome or Chromium to see your sensor",
+  idle: "Click anywhere to connect your MPU-6500",
+  connecting: "Establishing link…",
+  waiting: "Link established. Waiting for angle data…",
+  busy: "The port is busy. Close the serial monitor and click again",
+};
+let hintKey = null;
+function setHint(key) {
+  if (key === hintKey) return;
+  hintKey = key;
+  if (!key) { hintEl.classList.remove("show", "breathe"); document.body.style.cursor = "default"; return; }
+  hintEl.textContent = HINTS[key];
+  document.body.style.cursor = key === "idle" || key === "busy" ? "pointer" : "default";
+  hintEl.classList.add("show");
+  hintEl.classList.toggle("breathe", key === "idle" || key === "waiting");
+}
+
+/* ==========================================================================
+   Web Serial: one click the first time, automatic afterwards
+   ========================================================================== */
+const hasSerial = "serial" in navigator;
+const demoMode = location.hash === "#demo";
+const link = { port: null, reader: null, pipe: null, busy: false };
+let connected = false;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function openPort(port, attempts = 1) {
+  if (link.busy || link.port) return false;
+  link.busy = true;
+  setHint("connecting");
+  let lastErr = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await port.open({ baudRate: CONFIG.baudRate });
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      if (e.name === "InvalidStateError") { lastErr = null; break; } // already open
+      await sleep(400);
+    }
+  }
+  link.busy = false;
+  if (lastErr) {
+    setHint(lastErr.name === "NetworkError" ? "busy" : "idle");
+    return false;
+  }
+  // The Pico SDK only sends stdio over USB once DTR is asserted
+  try { await port.setSignals({ dataTerminalReady: true, requestToSend: true }); } catch {}
+  link.port = port;
+  connected = true;
+  resetSensor();
+  setHint("waiting");
+  readLoop(port);
+  return true;
+}
+
+async function readLoop(port) {
+  const decoder = new TextDecoderStream();
+  link.pipe = port.readable.pipeTo(decoder.writable).catch(() => {});
+  const reader = decoder.readable.getReader();
+  link.reader = reader;
+  let buf = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      let i;
+      while ((i = buf.search(/[\r\n]/)) >= 0) {
+        const line = buf.slice(0, i);
+        buf = buf.slice(i + 1);
+        if (line) onLine(line);
+      }
+      if (buf.length > 2048) buf = "";
+    }
+  } catch {}
+  try { reader.releaseLock(); } catch {}
+  await closePort(port);
+}
+
+async function closePort(port) {
+  if (!link.port || (port && link.port !== port)) return;
+  const p = link.port;
+  link.port = null;
+  try { await link.reader?.cancel(); } catch {}
+  try { await link.pipe; } catch {}
+  try { await p.close(); } catch {}
+  connected = false;
+  resetSensor();
+  setHint("idle");
+}
+
+async function userConnect() {
+  if (!hasSerial || link.port || link.busy || demoMode) return;
+  try {
+    const port = await navigator.serial.requestPort();
+    await openPort(port, 3);
+  } catch (e) {
+    if (e.name !== "NotFoundError") setHint("idle");
+  }
+}
+
+if (demoMode) {
+  connected = true;
+  const t0 = performance.now();
+  setTimeout(function feed() {
+    const t = (performance.now() - t0) / 1000;
+    const r = 34 * Math.sin(t * 0.7) + 10 * Math.sin(t * 2.1) + (Math.random() - 0.5) * 1.6;
+    const p = 24 * Math.sin(t * 0.47 + 1) + (Math.random() - 0.5) * 1.6;
+    onLine(`${r.toFixed(2)},${p.toFixed(2)}`);
+    setTimeout(feed, 10);
+  }, 1800);
+} else if (!hasSerial) {
+  setHint("unsupported");
+} else {
+  setHint("idle");
+  window.addEventListener("pointerdown", userConnect);
+  window.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") userConnect(); });
+  navigator.serial.addEventListener("connect", (e) => { if (!link.port) openPort(e.target, 6); });
+  navigator.serial.addEventListener("disconnect", (e) => closePort(e.target));
+  navigator.serial.getPorts().then((ports) => { if (ports.length) openPort(ports[0], 3); });
+}
+
+/* ==========================================================================
+   Renderer, camera, post-processing
+   ========================================================================== */
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+const DPR = Math.min(window.devicePixelRatio, 2);
+renderer.setPixelRatio(DPR);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x01030a);
+const camera = new THREE.PerspectiveCamera(32, window.innerWidth / window.innerHeight, 0.05, 400);
+
+const rt = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: 4 });
+const composer = new EffectComposer(renderer, rt);
+composer.setPixelRatio(DPR);
+composer.setSize(window.innerWidth, window.innerHeight);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.7, 0.5, 0.3);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+const finishPass = new ShaderPass({
+  uniforms: { tDiffuse: { value: null }, uTime: { value: 0 }, uRes: { value: new THREE.Vector2(1, 1) }, uGlitch: { value: 0 } },
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `
+    uniform sampler2D tDiffuse; uniform float uTime, uGlitch; uniform vec2 uRes; varying vec2 vUv;
+    float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+    void main(){
+      vec2 c = vUv - 0.5;
+      float d = length(c * vec2(uRes.x / uRes.y, 1.0));
+      vec2 off = c * (0.0025 + uGlitch * 0.012) * (0.4 + d);
+      vec3 col;
+      col.r = texture2D(tDiffuse, vUv + off).r;
+      col.g = texture2D(tDiffuse, vUv).g;
+      col.b = texture2D(tDiffuse, vUv - off).b;
+      col *= mix(1.0, 0.3, smoothstep(0.3, 1.05, d));
+      col += (hash(vUv * uRes + fract(uTime) * 61.0) - 0.5) * 0.02;
+      gl_FragColor = vec4(col, 1.0);
+    }`,
+});
+composer.addPass(finishPass);
+
+/* ==========================================================================
+   Hologram shading. Shared uniforms drive every holographic part at once.
+   ========================================================================== */
+const HOLO = new THREE.Color(0x46dcff);
+const holoU = {
+  uTime: { value: 0 },
+  uScanY: { value: 0 },
+  uPower: { value: 0.5 },     // overall brightness, rises when data is live
+  uFlicker: { value: 1 },     // multiplicative flicker
+  uGlitch: { value: 0 },      // slice displacement amount
+  uColor: { value: HOLO },
+};
+
+const HOLO_VERT = `
+  uniform float uTime, uGlitch;
+  varying vec3 vWorld, vN;
+  varying vec2 vUv;
+  float hash(float n){ return fract(sin(n) * 43758.5453); }
+  void main(){
+    vec4 w = modelMatrix * vec4(position, 1.0);
+    float slice = hash(floor(w.y * 22.0) + floor(uTime * 24.0));
+    w.x += uGlitch * 0.12 * (slice - 0.5) * step(0.6, slice);
+    vWorld = w.xyz;
+    #ifdef HAS_NORMAL
+      vN = normalize(mat3(modelMatrix) * normal);
+    #else
+      vN = vec3(0.0, 1.0, 0.0);
+    #endif
+    vUv = uv;
+    gl_Position = projectionMatrix * viewMatrix * w;
+  }`;
+const HOLO_FRAG = `
+  uniform float uTime, uScanY, uPower, uFlicker, uBase, uFres;
+  uniform vec3 uColor;
+  uniform sampler2D uMap;
+  varying vec3 vWorld, vN;
+  varying vec2 vUv;
+  void main(){
+    vec3 V = normalize(cameraPosition - vWorld);
+    float fr = 0.0;
+    #ifdef HAS_NORMAL
+      fr = pow(1.0 - abs(dot(normalize(vN), V)), 2.2);
+    #endif
+    float bands = 0.7 + 0.3 * sin(vWorld.y * 150.0 - uTime * 5.0);
+    float slow = 0.82 + 0.18 * sin(vWorld.y * 7.0 + uTime * 1.4);
+    float scan = exp(-pow((vWorld.y - uScanY) * 9.0, 2.0));
+    float a = (uBase + uFres * fr) * bands * slow;
+    #ifdef HAS_MAP
+      a *= texture2D(uMap, vUv).a;
+    #endif
+    vec3 col = uColor * a * uPower * uFlicker;
+    col += vec3(0.75, 0.97, 1.0) * scan * a * 2.2 * uPower;
+    gl_FragColor = vec4(col, 1.0);
+  }`;
+
+function holoMaterial({ base = 0.05, fres = 1.0, map = null, normals = true } = {}) {
+  const defines = {};
+  if (normals) defines.HAS_NORMAL = "";
+  if (map) defines.HAS_MAP = "";
+  return new THREE.ShaderMaterial({
+    defines,
+    uniforms: { ...holoU, uBase: { value: base }, uFres: { value: fres }, uMap: { value: map } },
+    vertexShader: HOLO_VERT,
+    fragmentShader: HOLO_FRAG,
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+  });
+}
+const lineMat = holoMaterial({ base: 0.75, fres: 0, normals: false });
+const lineMatDim = holoMaterial({ base: 0.3, fres: 0, normals: false });
+
+// a solid outline + translucent body for any geometry
+function holoPart(geo, { base = 0.05, fres = 0.9, edges = true, dimEdges = false, threshold = 25 } = {}) {
+  const g = new THREE.Group();
+  g.add(new THREE.Mesh(geo, holoMaterial({ base, fres })));
+  if (edges) g.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo, threshold), dimEdges ? lineMatDim : lineMat));
+  return g;
+}
+
+/* ==========================================================================
+   The room: dark floor with a faint grid, the projector and its light cone
+   ========================================================================== */
+const FLOOR_Y = -2.05;
+{
+  const floorMat = new THREE.ShaderMaterial({
+    uniforms: { uTime: holoU.uTime, uPower: holoU.uPower, uColor: holoU.uColor },
+    vertexShader: `varying vec3 vWorld; void main(){ vec4 w = modelMatrix * vec4(position, 1.0); vWorld = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }`,
+    fragmentShader: `
+      uniform float uTime, uPower; uniform vec3 uColor; varying vec3 vWorld;
+      float gridLine(vec2 p, float s){ vec2 q = p / s; vec2 g = abs(fract(q - 0.5) - 0.5) / fwidth(q); return 1.0 - min(min(g.x, g.y), 1.0); }
+      void main(){
+        vec2 p = vWorld.xz;
+        float r = length(p);
+        float grid = gridLine(p, 0.5) * 0.35 + gridLine(p, 2.5) * 0.5;
+        float fade = exp(-r * 0.22);
+        float pool = exp(-r * r * 0.7) * 0.6;
+        vec3 col = vec3(0.004, 0.008, 0.016) + uColor * (grid * fade * 0.05 + pool * 0.12 * uPower);
+        gl_FragColor = vec4(col, 1.0);
+      }`,
+  });
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(120, 120), floorMat);
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.y = FLOOR_Y;
+  scene.add(floor);
+}
+
+// projector base, a real object lit by the beam and a cool fill
+const envScene = new THREE.Scene();
+envScene.background = new THREE.Color(0x020409);
+{
+  const add = (w, h, color, k, pos) => {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color: new THREE.Color(color).multiplyScalar(k), side: THREE.DoubleSide }));
+    m.position.copy(pos); m.lookAt(0, 0, 0); envScene.add(m);
+  };
+  add(30, 14, 0xbfe9ff, 1.4, new THREE.Vector3(4, 30, 14));
+  add(4, 30, 0x46dcff, 2.0, new THREE.Vector3(-28, 4, -12));
+  add(4, 30, 0x46dcff, 1.4, new THREE.Vector3(26, 4, -18));
+}
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(envScene, 0.04).texture;
+
+const projector = new THREE.Group();
+projector.position.y = FLOOR_Y;
+scene.add(projector);
+{
+  const metal = new THREE.MeshStandardMaterial({ color: 0x1a1f26, metalness: 0.9, roughness: 0.32 });
+  const darker = new THREE.MeshStandardMaterial({ color: 0x0b0e12, metalness: 0.7, roughness: 0.5 });
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(1.05, 1.18, 0.16, 96), metal);
+  base.position.y = 0.08;
+  const deck = new THREE.Mesh(new THREE.CylinderGeometry(0.82, 1.0, 0.1, 96), darker);
+  deck.position.y = 0.21;
+  const lip = new THREE.Mesh(new THREE.TorusGeometry(0.66, 0.025, 16, 96), metal);
+  lip.rotation.x = Math.PI / 2; lip.position.y = 0.262;
+  projector.add(base, deck, lip);
+}
+const lensMat = new THREE.MeshBasicMaterial({ color: HOLO.clone().multiplyScalar(0.9) });
+const lens = new THREE.Mesh(new THREE.CircleGeometry(0.6, 96), lensMat);
+lens.rotation.x = -Math.PI / 2; lens.position.y = 0.262;
+projector.add(lens);
+const beamLight = new THREE.PointLight(0x46dcff, 4, 6, 2);
+beamLight.position.y = 0.6;
+projector.add(beamLight);
+scene.add(new THREE.HemisphereLight(0x6fa6c8, 0x05070a, 0.35));
+
+// floor rings around the projector, drawn once into textures
+function ringTexture(drawFn) {
+  const c = document.createElement("canvas"); c.width = c.height = 1024;
+  const g = c.getContext("2d");
+  g.translate(512, 512);
+  g.strokeStyle = "#fff"; g.fillStyle = "#fff";
+  drawFn(g);
+  const t = new THREE.CanvasTexture(c);
+  t.anisotropy = 8;
+  return t;
+}
+const ringA = ringTexture((g) => {
+  g.lineWidth = 3; g.beginPath(); g.arc(0, 0, 500, 0, Math.PI * 2); g.stroke();
+  for (let i = 0; i < 180; i++) {
+    const a = (i / 180) * Math.PI * 2, l = i % 15 === 0 ? 40 : i % 5 === 0 ? 22 : 10;
+    g.lineWidth = i % 15 === 0 ? 4 : 2;
+    g.beginPath(); g.moveTo(Math.cos(a) * 496, Math.sin(a) * 496); g.lineTo(Math.cos(a) * (496 - l), Math.sin(a) * (496 - l)); g.stroke();
+  }
+  g.lineWidth = 10;
+  for (let i = 0; i < 4; i++) { g.beginPath(); g.arc(0, 0, 410, i * Math.PI / 2 + 0.2, i * Math.PI / 2 + 1.1); g.stroke(); }
+});
+const ringB = ringTexture((g) => {
+  g.lineWidth = 4;
+  g.setLineDash([26, 18]);
+  g.beginPath(); g.arc(0, 0, 490, 0, Math.PI * 2); g.stroke();
+  g.setLineDash([]);
+  g.lineWidth = 2;
+  g.beginPath(); g.arc(0, 0, 460, 0, Math.PI * 1.3); g.stroke();
+});
+function floorRing(tex, size, strength) {
+  const m = new THREE.Mesh(
+    new THREE.PlaneGeometry(size, size),
+    new THREE.ShaderMaterial({
+      uniforms: { uMap: { value: tex }, uPower: holoU.uPower, uColor: holoU.uColor, uK: { value: strength } },
+      vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: `uniform sampler2D uMap; uniform float uPower, uK; uniform vec3 uColor; varying vec2 vUv;
+        void main(){ float a = texture2D(uMap, vUv).a; gl_FragColor = vec4(uColor * a * uK * uPower, 1.0); }`,
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    })
+  );
+  m.rotation.x = -Math.PI / 2;
+  m.position.y = FLOOR_Y + 0.004;
+  scene.add(m);
+  return m;
+}
+const ring1 = floorRing(ringA, 3.0, 0.7);
+const ring2 = floorRing(ringB, 3.8, 0.45);
+
+// the light cone from the lens up to the board
+const beamMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: holoU.uTime, uPower: holoU.uPower, uColor: holoU.uColor, uFlicker: holoU.uFlicker },
+  vertexShader: `varying vec3 vWorld, vN; varying float vH;
+    void main(){ vH = uv.y; vec4 w = modelMatrix * vec4(position, 1.0); vWorld = w.xyz; vN = normalize(mat3(modelMatrix) * normal); gl_Position = projectionMatrix * viewMatrix * w; }`,
+  fragmentShader: `uniform float uTime, uPower, uFlicker; uniform vec3 uColor; varying vec3 vWorld, vN; varying float vH;
+    float hash(float n){ return fract(sin(n) * 43758.5453); }
+    void main(){
+      vec3 V = normalize(cameraPosition - vWorld);
+      float face = abs(dot(normalize(vN), V));
+      float ang = atan(vWorld.z, vWorld.x);
+      float streak = 0.55 + 0.45 * sin(ang * 23.0 + sin(ang * 7.0 + uTime * 0.7) * 2.0);
+      float flow = 0.75 + 0.25 * sin(vH * 30.0 - uTime * 3.0);
+      float a = pow(1.0 - vH, 1.6) * (0.25 + 0.75 * pow(face, 1.5)) * streak * flow;
+      gl_FragColor = vec4(uColor * a * 0.22 * uPower * uFlicker, 1.0);
+    }`,
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+});
+{
+  const h = 2.0;
+  const cone = new THREE.Mesh(new THREE.CylinderGeometry(1.75, 0.58, h, 96, 1, true), beamMat);
+  cone.position.y = FLOOR_Y + 0.27 + h / 2;
+  scene.add(cone);
+}
+
+// motes rising through the beam
+const moteMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: holoU.uTime, uPower: holoU.uPower, uColor: holoU.uColor, uPR: { value: DPR } },
+  vertexShader: `attribute vec3 aSeed; uniform float uTime, uPR; varying float vA;
+    void main(){
+      float h = fract(aSeed.x + uTime * (0.05 + aSeed.y * 0.08));
+      float r = mix(0.5, 1.7, h) * aSeed.z;
+      float ang = aSeed.x * 40.0 + uTime * 0.2 * (aSeed.y - 0.5);
+      vec3 p = vec3(cos(ang) * r, ${FLOOR_Y.toFixed(2)} + 0.3 + h * 2.1, sin(ang) * r);
+      vec4 mv = modelViewMatrix * vec4(p, 1.0);
+      gl_Position = projectionMatrix * mv;
+      gl_PointSize = (2.0 + aSeed.y * 3.0) * uPR * (6.0 / -mv.z);
+      vA = sin(h * 3.14159);
+    }`,
+  fragmentShader: `uniform float uPower; uniform vec3 uColor; varying float vA;
+    void main(){ vec2 p = gl_PointCoord * 2.0 - 1.0; float a = exp(-dot(p, p) * 4.0) * vA; gl_FragColor = vec4(uColor * a * 0.9 * uPower, 1.0); }`,
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+});
+{
+  const n = 260, seeds = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) seeds.set([Math.random(), Math.random(), Math.sqrt(Math.random())], i * 3);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+  g.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 3));
+  const motes = new THREE.Points(g, moteMat);
+  motes.frustumCulled = false;
+  scene.add(motes);
+}
+
+/* ==========================================================================
+   The board as a hologram.
+   Units: 1 = 10 mm. Sensor frame: X right, Y forward, Z up.
+   three.js: sensor X -> x, sensor Y -> -z, sensor Z -> y.
+   ========================================================================== */
+const W = 2.6, D = 1.6, T = 0.16, CORNER = 0.07;
+const TOP = T / 2;
+const PITCH = 0.254, PIN_Y = -0.6;
+const PIN_NAMES = ["VCC", "GND", "SCL", "SDA", "EDA", "ECL", "AD0", "INT", "NCS", "FSYNC"];
+const pinX = (i) => (i - 4.5) * PITCH;
+const HOLES = [[-1.02, 0.47], [1.02, 0.47]];
+const HOLE_R = 0.15;
+const CHIP = { x: 0.0, y: 0.2, s: 0.44 };
+
+const board = new THREE.Group();
+const boardRoot = new THREE.Group();
+boardRoot.add(board);
+scene.add(boardRoot);
+const at = (obj, x, y, h = TOP) => { obj.position.set(x, h, -y); return obj; };
+
+// PCB outline with real holes
+{
+  const shape = new THREE.Shape();
+  const w = W / 2, d = D / 2, r = CORNER;
+  shape.moveTo(-w + r, -d); shape.lineTo(w - r, -d); shape.quadraticCurveTo(w, -d, w, -d + r);
+  shape.lineTo(w, d - r); shape.quadraticCurveTo(w, d, w - r, d); shape.lineTo(-w + r, d);
+  shape.quadraticCurveTo(-w, d, -w, d - r); shape.lineTo(-w, -d + r); shape.quadraticCurveTo(-w, -d, -w + r, -d);
+  for (const [hx, hy] of HOLES) { const h = new THREE.Path(); h.absarc(hx, hy, HOLE_R, 0, Math.PI * 2, true); shape.holes.push(h); }
+  const geo = new THREE.ExtrudeGeometry(shape, { depth: T, bevelEnabled: false, curveSegments: 28 });
+  geo.rotateX(-Math.PI / 2);
+  geo.translate(0, -T / 2, 0);
+  board.add(holoPart(geo, { base: 0.02, fres: 0.35, threshold: 40 }));
+}
+
+// silkscreen, pads and a faint copper pattern as one glowing layer
+{
+  const TEX_W = 2048, S = TEX_W / W, TEX_H = Math.round(D * S);
+  const c = document.createElement("canvas"); c.width = TEX_W; c.height = TEX_H;
+  const g = c.getContext("2d");
+  const X = (x) => (x + W / 2) * S, Y = (y) => (D / 2 - y) * S, L = (v) => v * S;
+  g.strokeStyle = g.fillStyle = "#fff";
+  // dotted grid, like a scan of the copper
+  g.globalAlpha = 0.18;
+  for (let x = 0.08; x < W; x += 0.08) for (let y = 0.08; y < D; y += 0.08) g.fillRect(x * S - 2, y * S - 2, 4, 4);
+  g.globalAlpha = 1;
+  g.lineWidth = L(0.012);
+  g.strokeRect(L(0.06), L(0.06), TEX_W - L(0.12), TEX_H - L(0.12));
+  for (let i = 0; i < 10; i++) {
+    g.lineWidth = L(0.016);
+    g.beginPath(); g.arc(X(pinX(i)), Y(PIN_Y), L(0.085), 0, Math.PI * 2); g.stroke();
+    g.save(); g.translate(X(pinX(i)), Y(-0.462)); g.rotate(-Math.PI / 2);
+    g.font = `600 ${L(0.058)}px Oxanium, "DejaVu Sans Mono", monospace`;
+    g.textAlign = "left"; g.textBaseline = "middle"; g.fillText(PIN_NAMES[i], 0, 0); g.restore();
+  }
+  for (const [hx, hy] of HOLES) {
+    g.lineWidth = L(0.02); g.beginPath(); g.arc(X(hx), Y(hy), L(0.24), 0, Math.PI * 2); g.stroke();
+    g.lineWidth = L(0.008); g.beginPath(); g.arc(X(hx), Y(hy), L(0.3), 0, Math.PI * 2); g.stroke();
+  }
+  g.font = `600 ${L(0.11)}px Oxanium, "DejaVu Sans Mono", monospace`;
+  g.textAlign = "center"; g.textBaseline = "middle";
+  g.fillText("MPU-6500", X(0), Y(0.64));
+  const o = CHIP.s / 2 + 0.05;
+  g.lineWidth = L(0.012); g.strokeRect(X(CHIP.x - o), Y(CHIP.y + o), L(2 * o), L(2 * o));
+  // axes
+  const ax = 0.86, ay = -0.06, len = 0.22;
+  g.lineWidth = L(0.014);
+  g.beginPath(); g.moveTo(X(ax), Y(ay)); g.lineTo(X(ax + len), Y(ay)); g.moveTo(X(ax), Y(ay)); g.lineTo(X(ax), Y(ay + len)); g.stroke();
+  g.font = `600 ${L(0.055)}px Oxanium, monospace`;
+  g.fillText("X", X(ax + len + 0.04), Y(ay + 0.05));
+  g.fillText("Y", X(ax - 0.06), Y(ay + len + 0.02));
+  g.globalCompositeOperation = "destination-out";
+  for (const [hx, hy] of HOLES) { g.beginPath(); g.arc(X(hx), Y(hy), L(HOLE_R), 0, Math.PI * 2); g.fill(); }
+  const tex = new THREE.CanvasTexture(c);
+  tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  const silk = new THREE.Mesh(new THREE.PlaneGeometry(W, D), holoMaterial({ base: 0.75, fres: 0, map: tex, normals: false }));
+  silk.rotation.x = -Math.PI / 2;
+  silk.position.y = TOP + 0.002;
+  board.add(silk);
+}
+
+// chip
+{
+  const geo = new RoundedBoxGeometry(CHIP.s, 0.1, CHIP.s, 2, 0.012);
+  const chip = holoPart(geo, { base: 0.05, fres: 0.7, threshold: 30 });
+  board.add(at(chip, CHIP.x, CHIP.y, TOP + 0.054));
+  const cross = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(-0.15, 0, -0.15), new THREE.Vector3(0.15, 0, 0.15),
+    new THREE.Vector3(-0.15, 0, 0.15), new THREE.Vector3(0.15, 0, -0.15),
+  ]);
+  board.add(at(new THREE.LineSegments(cross, lineMatDim), CHIP.x, CHIP.y, TOP + 0.106));
+}
+
+// header: spacer and pins
+{
+  const g = new THREE.Group();
+  const spacer = holoPart(new THREE.BoxGeometry(10 * PITCH - 0.01, 0.25, 0.25), { base: 0.025, fres: 0.4 });
+  spacer.position.y = -TOP - 0.125;
+  g.add(spacer);
+  const pinTop = TOP + 0.1, pinBottom = -TOP - 0.25 - 0.6;
+  const pinGeo = new THREE.BoxGeometry(0.06, pinTop - pinBottom, 0.06);
+  const edges = new THREE.EdgesGeometry(pinGeo);
+  for (let i = 0; i < 10; i++) {
+    const m = new THREE.Mesh(pinGeo, holoMaterial({ base: 0.03, fres: 0.35 }));
+    const l = new THREE.LineSegments(edges, lineMatDim);
+    m.position.set(pinX(i), (pinTop + pinBottom) / 2, 0);
+    l.position.copy(m.position);
+    g.add(m, l);
+  }
+  g.position.z = -PIN_Y;
+  board.add(g);
+}
+
+// power LED: a bright point that turns on with the connection
+const ledMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(0xffffff), transparent: true, opacity: 0 });
+{
+  const led = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.035, 0.06), ledMat);
+  board.add(at(led, -0.62, 0.12, TOP + 0.02));
+}
+
+board.position.set(0, 0.0, CHIP.y * 0.4);
+
+// world-level reference ring: shows tilt against true horizontal
+const levelRing = new THREE.Group();
+{
+  const pts = [];
+  for (let i = 0; i <= 256; i++) { const a = (i / 256) * Math.PI * 2; pts.push(new THREE.Vector3(Math.cos(a) * 2.0, 0, Math.sin(a) * 2.0)); }
+  levelRing.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), lineMatDim));
+  const ticks = [];
+  for (let i = 0; i < 72; i++) {
+    const a = (i / 72) * Math.PI * 2, l = i % 6 === 0 ? 0.14 : 0.06;
+    ticks.push(new THREE.Vector3(Math.cos(a) * 2.0, 0, Math.sin(a) * 2.0), new THREE.Vector3(Math.cos(a) * (2.0 - l), 0, Math.sin(a) * (2.0 - l)));
+  }
+  levelRing.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(ticks), lineMatDim));
+}
+scene.add(levelRing);
+
+
+/* ==========================================================================
+   Orientation
+   ========================================================================== */
+function quatFromRollPitch(rollDeg, pitchDeg, out) {
+  const r = rollDeg * RAD, p = pitchDeg * RAD;
+  const cr = Math.cos(r / 2), sr = Math.sin(r / 2), cp = Math.cos(p / 2), sp = Math.sin(p / 2);
+  const w = cr * cp, x = sr * cp, y = cr * sp, z = -sr * sp;
+  return out.set(x, z, -y, w).normalize();
+}
+
+const qLive = new THREE.Quaternion();
+const qIdle = new THREE.Quaternion();
+const qTarget = new THREE.Quaternion();
+const eIdle = new THREE.Euler(0, 0, 0, "YXZ");
+let liveW = 0, ledW = 0;
+
+/* ==========================================================================
+   Camera drift
+   ========================================================================== */
+const pointer = { x: 0, y: 0, sx: 0, sy: 0 };
+window.addEventListener("pointermove", (e) => {
+  pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
+  pointer.y = (e.clientY / window.innerHeight) * 2 - 1;
+});
+
+function placeCamera(t, dt) {
+  const k = 1 - Math.exp(-dt * 1.5);
+  pointer.sx += (pointer.x - pointer.sx) * k;
+  pointer.sy += (pointer.y - pointer.sy) * k;
+  const m = reducedMotion ? 0 : 1;
+  const az = m * (0.34 * Math.sin(t * 0.04) + 0.06 * Math.sin(t * 0.13)) + pointer.sx * 0.12;
+  const el = 0.3 + m * 0.04 * Math.sin(t * 0.06) - pointer.sy * 0.05;
+  const vfov = camera.fov * RAD;
+  const hfov = 2 * Math.atan(Math.tan(vfov / 2) * camera.aspect);
+  const r = Math.max(9.4, 2.6 / Math.tan(hfov / 2));
+  camera.position.set(r * Math.sin(az) * Math.cos(el), -0.45 + r * Math.sin(el), r * Math.cos(az) * Math.cos(el));
+  camera.lookAt(0, -0.62, 0);
+}
+
+/* ==========================================================================
+   Main loop
+   ========================================================================== */
+const clock = new THREE.Clock();
+let first = true;
+let glitchT = -1, nextGlitch = 2.5;
+let flick = 1;
+
+function frame() {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  const t = clock.elapsedTime;
+
+  const now = performance.now();
+  const live = connected && now - sensor.lastSampleAt < CONFIG.staleAfterMs;
+  liveW += ((live ? 1 : 0) - liveW) * (1 - Math.exp(-dt * (live ? 1.6 : 1.0)));
+  ledW += ((connected ? 1 : 0) - ledW) * (1 - Math.exp(-dt * 6));
+
+  if (connected && !demoMode) setHint(live ? null : "waiting");
+  else if (demoMode) setHint(null);
+
+  const spin = reducedMotion ? 0.06 : 0.22;
+  eIdle.set(0.3 + 0.08 * Math.sin(t * 0.37), t * spin, 0.1 * Math.sin(t * 0.5));
+  qIdle.setFromEuler(eIdle);
+  quatFromRollPitch(sensor.roll, sensor.pitch, qLive);
+
+  const w = liveW * liveW * (3 - 2 * liveW);
+  qTarget.copy(qIdle).slerp(qLive, w);
+  boardRoot.quaternion.slerp(qTarget, 1 - Math.exp(-dt * (3 + 27 * w)));
+  boardRoot.position.y = 0.08 * Math.sin(t * 0.9) * (1 - 0.7 * w);
+
+  // A weak signal flickers and glitches; a locked one is calm
+  const unstable = 1 - w;
+  if (!reducedMotion) {
+    const target = Math.random() < 0.04 + 0.2 * unstable ? 0.55 + Math.random() * 0.35 : 1;
+    flick += (target - flick) * 0.5;
+    if (t > nextGlitch) { glitchT = t; nextGlitch = t + (unstable > 0.5 ? 1.5 + Math.random() * 3 : 5 + Math.random() * 7); }
+  }
+  const g = glitchT >= 0 ? Math.max(0, 1 - (t - glitchT) / 0.22) : 0;
+  holoU.uGlitch.value = g * (0.5 + 0.5 * unstable);
+  finishPass.uniforms.uGlitch.value = g * 0.6;
+  holoU.uFlicker.value = flick * (1 - g * 0.3 * Math.random());
+  holoU.uPower.value = 0.5 + 0.5 * w;
+  holoU.uTime.value = t;
+  holoU.uScanY.value = -1.0 + ((t * 0.45) % 1) * 2.4;
+
+  ledMat.opacity = ledW;
+  ledMat.color.setRGB(0.8 + 1.4 * ledW, 1.0 + 1.6 * ledW, 1.0 + 1.8 * ledW);
+  lensMat.color.copy(HOLO).multiplyScalar(0.6 + 0.5 * w);
+  beamLight.intensity = 2.5 + 2.5 * w;
+  ring1.rotation.z += dt * 0.12;
+  ring2.rotation.z -= dt * 0.07;
+  levelRing.position.y = boardRoot.position.y + 0.08;
+
+  placeCamera(t, dt);
+  finishPass.uniforms.uTime.value = t;
+  composer.render();
+
+  if (first) { first = false; requestAnimationFrame(() => document.getElementById("veil").classList.add("gone")); }
+  requestAnimationFrame(frame);
+}
+boardRoot.quaternion.setFromEuler(new THREE.Euler(0.3, -0.6, 0, "YXZ"));
+
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
+  composer.setSize(w, h);
+  finishPass.uniforms.uRes.value.set(w * DPR, h * DPR);
+}
+window.addEventListener("resize", resize);
+resize();
+requestAnimationFrame(frame);
+
+// for testing without hardware: paste lines into the console, e.g. feed("12.5,-3")
+window.feed = onLine;
+</script>
+</body>
+</html>
